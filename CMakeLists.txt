@@ -1,4 +1,7 @@
-FILE(GLOB_RECURSE sources ./*.*)
-idf_component_register(SRCS ${sources} INCLUDE_DIRS .
-REQUIRES NMEA2000
+FILE(GLOB_RECURSE sources ./*.cpp)
+
+idf_component_register(
+        SRCS ${sources}
+        INCLUDE_DIRS .
+        REQUIRES driver NMEA2000 esp_event freertos soc
 )
