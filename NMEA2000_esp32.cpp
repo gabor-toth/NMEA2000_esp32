@@ -27,268 +27,273 @@ libraries, I implemented his code directly to the NMEA2000_esp32 to avoid extra
 can.h library, which may cause even naming problem.
 */
 
-#include "driver/periph_ctrl.h"
-#include <rom/gpio.h>
-
-#include "soc/dport_reg.h"
+#include <driver/twai.h>
+#include "freertos/timers.h"
+#include <hal/twai_hal.h>
+#include "sdkconfig.h"
+#include "soc/dport_access.h"
+#include "soc/system_reg.h"
+#include "esp_log.h"
 #include "NMEA2000_esp32.h"
 
-#if !defined(round)
-#include <math.h>
-#endif
+static const char *LOG = "n2k_esp32";
 
-bool tNMEA2000_esp32::CanInUse=false;
-tNMEA2000_esp32 *pNMEA2000_esp32=0;
-
-void ESP32Can1Interrupt(void *);
+bool tNMEA2000_esp32::CanInUse = false;
+int tNMEA2000_esp32::receive_timeout_secs = 30;
+static tNMEA2000_esp32 *instance;
 
 //*****************************************************************************
-tNMEA2000_esp32::tNMEA2000_esp32(gpio_num_t _TxPin,  gpio_num_t _RxPin) :
-    tNMEA2000(), IsOpen(false),
-    speed(CAN_SPEED_250KBPS), TxPin(_TxPin), RxPin(_RxPin),
-    RxQueue(NULL), TxQueue(NULL) {
+tNMEA2000_esp32::tNMEA2000_esp32( gpio_num_t txPin, gpio_num_t rxPin, gpio_num_t standbyPin ) :
+        tNMEA2000(),
+        IsOpen( false ),
+        speed( CAN_SPEED_250KBPS ),
+        TxPin( txPin ),
+        RxPin( rxPin ),
+        StandbyPin( standbyPin ),
+        RxQueue( nullptr ),
+        TxQueue( nullptr ) {
+    ESP_LOGI( "tNMEA2000_esp32", "tNMEA2000_esp32 tx=%d rx=%d stdby=%d", TxPin, RxPin, StandbyPin );
+    instance = this;
 }
 
-//*****************************************************************************
-bool tNMEA2000_esp32::CANSendFrame(unsigned long id, unsigned char len, const unsigned char *buf, bool /*wait_sent*/) {
-  if ( uxQueueSpacesAvailable(TxQueue)==0 ) return false; // can not send to queue
-
-  tCANFrame frame;
-  frame.id=id;
-  frame.len=len>8?8:len;
-  memcpy(frame.buf,buf,len);
-
-  xQueueSendToBack(TxQueue,&frame,0);  // Add frame to queue
-  if ( MODULE_CAN->SR.B.TBS==0 ) return true; // Currently sending, ISR takes care of sending
-
-  if ( MODULE_CAN->SR.B.TBS==1 ) { // Check again and restart send, if is not going on
-    xQueueReceive(TxQueue,&frame,0);
-    CAN_send_frame(frame);
-  }
-
-  return true;
-}
-
-//*****************************************************************************
 void tNMEA2000_esp32::InitCANFrameBuffers() {
-    if (MaxCANReceiveFrames<10 ) MaxCANReceiveFrames=50; // ESP32 has plenty of RAM
-    if (MaxCANSendFrames<10 ) MaxCANSendFrames=40;
-    uint16_t CANGlobalBufSize=MaxCANSendFrames-4;
-    MaxCANSendFrames=4;  // we do not need much libary internal buffer since driver has them.
-    RxQueue=xQueueCreate(MaxCANReceiveFrames,sizeof(tCANFrame));
-    TxQueue=xQueueCreate(CANGlobalBufSize,sizeof(tCANFrame));
+    if ( MaxCANReceiveFrames < 10 ) MaxCANReceiveFrames = 50; // ESP32 has plenty of RAM
+    if ( MaxCANSendFrames < 10 ) MaxCANSendFrames = 40;
+    uint16_t CANGlobalBufSize = MaxCANSendFrames - 4;
+    MaxCANSendFrames = 4;  // we do not need much library internal buffer since driver has them.
+    RxQueue = xQueueCreate( MaxCANReceiveFrames, sizeof( tCANFrame ));
+    TxQueue = xQueueCreate( CANGlobalBufSize, sizeof( twai_message_t ));
 
     tNMEA2000::InitCANFrameBuffers(); // call main initialization
 }
 
-//*****************************************************************************
 bool tNMEA2000_esp32::CANOpen() {
-    if (IsOpen) return true;
+    if ( IsOpen ) return true;
+    if ( CanInUse ) return false;
 
-    if (CanInUse) return false; // currently prevent accidental second instance. Maybe possible in future.
-
-    pNMEA2000_esp32=this;
-    IsOpen=true;
+    IsOpen = true;
     CAN_init();
 
-    CanInUse=IsOpen;
+    CanInUse = IsOpen;
 
     return IsOpen;
 }
 
+void tNMEA2000_esp32::CAN_init() {
+    gpio_config_t io_conf = {};
+
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT_OD;
+    io_conf.pin_bit_mask = BIT( StandbyPin );
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config( &io_conf );
+    gpio_set_level( StandbyPin, 0 );
+
+    //Initialize configuration structures using macro initializers
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT( TxPin, RxPin, TWAI_MODE_NO_ACK );
+    g_config.alerts_enabled = TWAI_ALERT_ALL; //TWAI_ALERT_TX_IDLE;
+    g_config.intr_flags = ESP_INTR_FLAG_IRAM;
+    g_config.tx_queue_len = 20;
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    ESP_ERROR_CHECK( twai_driver_install( &g_config, &t_config, &f_config ));
+
+    ESP_ERROR_CHECK( twai_start());
+
+    create_event_tasks();
+}
+
 //*****************************************************************************
-bool tNMEA2000_esp32::CANGetFrame(unsigned long &id, unsigned char &len, unsigned char *buf) {
-  bool HasFrame=false;
-  tCANFrame frame;
+bool
+tNMEA2000_esp32::CANSendFrame( unsigned long id, unsigned char len, const unsigned char *buf, bool /*wait_sent*/ ) {
+    if ( uxQueueSpacesAvailable(TxQueue)==0 ) {
+        // can not send to queue
+        return false;
+    }
+
+    twai_message_t twai_frame;
+    twai_frame.flags = 0;
+    twai_frame.extd = true;
+    twai_frame.identifier = id;
+    if ( len > sizeof( twai_frame.data )) {
+        len = sizeof( twai_frame.data );
+    }
+    twai_frame.data_length_code = len;
+    memcpy( twai_frame.data, buf, len );
+
+    return xQueueSendToBack(TxQueue,&twai_frame,0) == pdTRUE;
+}
+
+void tNMEA2000_esp32::CAN_send_frame( void *frame ) {
+
+    twai_message_t *twai_frame = (twai_message_t *) frame;
+    for ( ;; ) {
+        esp_err_t result = twai_transmit( twai_frame, 0 );
+        if ( result == ESP_OK ) {
+            return;
+        }
+        if ( result == ESP_ERR_INVALID_STATE ) {
+            twai_status_info_t status_info;
+            twai_get_status_info( &status_info );
+            if ( status_info.state == TWAI_STATE_BUS_OFF ) {
+                ESP_LOGW( LOG, "Driver is in state %s, result is %04d, initiate recovery, dropping package",
+                          "TWAI_STATE_BUS_OFF", result );
+                twai_initiate_recovery();
+            } else if ( status_info.state == TWAI_STATE_STOPPED ) {
+                ESP_LOGW( LOG, "Driver is in state %s, result is %04d, start driver, retrying package",
+                          "TWAI_STATE_STOPPED", result );
+                twai_start();
+                continue;
+            } else if ( status_info.state == TWAI_STATE_RECOVERING ) {
+                ESP_LOGW( LOG, "Driver is in state %s, result is %04d", "TWAI_STATE_RECOVERING", result );
+            } else if ( status_info.state == TWAI_STATE_RUNNING ) {
+                ESP_LOGW( LOG, "Driver is in state %s, result is %04d", "TWAI_STATE_RUNNING", result );
+            } else {
+                ESP_LOGW( LOG, "Driver is in state %d, result is %04d", status_info.state, result );
+            }
+        } else if ( ESP_OK != result ) {
+            ESP_LOGW( LOG, "twai_transmit resulted in %d", result );
+            // TODO handle result, restart driver for example
+        }
+        return;
+    }
+}
+
+void tNMEA2000_esp32::send_task( void *arg ) {
+    (void) arg;
+
+    ESP_LOGI( LOG, "send_task starting" );
+    for ( ;; ) {
+        twai_message_t frame;
+
+        if ( !xQueueReceive( TxQueue, &frame, portMAX_DELAY )) {
+            continue;
+        }
+        instance->CAN_send_frame( &frame );
+    }
+}
+
+//*****************************************************************************
+bool tNMEA2000_esp32::CANGetFrame( unsigned long &id, unsigned char &len, unsigned char *buf ) {
+
+    bool hasFrame = false;
+    tCANFrame frame;
 
     //receive next CAN frame from queue
-    if ( xQueueReceive(RxQueue,&frame, 0)==pdTRUE ) {
-      HasFrame=true;
-      id=frame.id;
-      len=frame.len;
-      memcpy(buf,frame.buf,frame.len);
+    if ( xQueueReceive( RxQueue, &frame, 0 ) == pdTRUE) {
+        hasFrame = true;
+        id = frame.id;
+        len = frame.len;
+        memcpy( buf, frame.buf, frame.len );
     }
 
-    return HasFrame;
+    return hasFrame;
 }
 
-//*****************************************************************************
-void tNMEA2000_esp32::CAN_init() {
+void tNMEA2000_esp32::receive_task( void *arg ) {
+    (void) arg;
 
-	//Time quantum
-	double __tq;
-
-
-  // A soft reset of the ESP32 leaves it's CAN controller in an undefined state so a reset is needed.
-  // Reset CAN controller to same state as it would be in after a power down reset.
-  periph_module_reset(PERIPH_CAN_MODULE);
-
-
-    //enable module
-  DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_CAN_CLK_EN);
-  DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_CAN_RST);
-
-    //configure RX pin
-	gpio_set_direction(RxPin,GPIO_MODE_INPUT);
-	gpio_matrix_in(RxPin,CAN_RX_IDX,0);
-	gpio_pad_select_gpio(RxPin);
-
-    //set to PELICAN mode
-	MODULE_CAN->CDR.B.CAN_M=0x1;
-
-	//synchronization jump width is the same for all baud rates
-	MODULE_CAN->BTR0.B.SJW		=0x1;
-
-	//TSEG2 is the same for all baud rates
-	MODULE_CAN->BTR1.B.TSEG2	=0x1;
-
-	//select time quantum and set TSEG1
-	switch (speed) {
-		case CAN_SPEED_1000KBPS:
-			MODULE_CAN->BTR1.B.TSEG1	=0x4;
-			__tq = 0.125;
-			break;
-
-		case CAN_SPEED_800KBPS:
-			MODULE_CAN->BTR1.B.TSEG1	=0x6;
-			__tq = 0.125;
-			break;
-		default:
-			MODULE_CAN->BTR1.B.TSEG1	=0xc;
-			__tq = ((float)1000/speed) / 16;
-	}
-
-	//set baud rate prescaler
-	MODULE_CAN->BTR0.B.BRP=(uint8_t)round((((APB_CLK_FREQ * __tq) / 2) - 1)/1000000)-1;
-
-    /* Set sampling
-     * 1 -> triple; the bus is sampled three times; recommended for low/medium speed buses     (class A and B) where filtering spikes on the bus line is beneficial
-     * 0 -> single; the bus is sampled once; recommended for high speed buses (SAE class C)*/
-    MODULE_CAN->BTR1.B.SAM	=0x1;
-
-    //enable all interrupts
-    MODULE_CAN->IER.U = 0xef;  // bit 0x10 contains Baud Rate Prescaler Divider (BRP_DIV) bit
-
-    //no acceptance filtering, as we want to fetch all messages
-    MODULE_CAN->MBX_CTRL.ACC.CODE[0] = 0;
-    MODULE_CAN->MBX_CTRL.ACC.CODE[1] = 0;
-    MODULE_CAN->MBX_CTRL.ACC.CODE[2] = 0;
-    MODULE_CAN->MBX_CTRL.ACC.CODE[3] = 0;
-    MODULE_CAN->MBX_CTRL.ACC.MASK[0] = 0xff;
-    MODULE_CAN->MBX_CTRL.ACC.MASK[1] = 0xff;
-    MODULE_CAN->MBX_CTRL.ACC.MASK[2] = 0xff;
-    MODULE_CAN->MBX_CTRL.ACC.MASK[3] = 0xff;
-
-    //set to normal mode
-    MODULE_CAN->OCR.B.OCMODE=__CAN_OC_NOM;
-
-    //clear error counters
-    MODULE_CAN->TXERR.U = 0;
-    MODULE_CAN->RXERR.U = 0;
-    (void)MODULE_CAN->ECC;
-
-    //clear interrupt flags
-    (void)MODULE_CAN->IR.U;
-
-    //install CAN ISR
-    esp_intr_alloc(ETS_CAN_INTR_SOURCE,0,ESP32Can1Interrupt,NULL,NULL);
-
-    //configure TX pin
-    // We do late configure, since some initialization above caused CAN Tx flash
-    // shortly causing one error frame on startup. By setting CAN pin here
-    // it works right.
-    gpio_set_direction(TxPin,GPIO_MODE_OUTPUT);
-    gpio_matrix_out(TxPin,CAN_TX_IDX,0,0);
-    gpio_pad_select_gpio(TxPin);
-
-    //Showtime. Release Reset Mode.
-    MODULE_CAN->MOD.B.RM = 0;
-}
-
-//*****************************************************************************
-void tNMEA2000_esp32::CAN_read_frame() {
-	tCANFrame frame;
-  CAN_FIR_t FIR;
-
-	//get FIR
-	FIR.U=MODULE_CAN->MBX_CTRL.FCTRL.FIR.U;
-  frame.len=FIR.B.DLC>8?8:FIR.B.DLC;
-
-  // Handle only extended frames
-  if (FIR.B.FF==CAN_frame_ext) {  //extended frame
-    //Get Message ID
-    frame.id = _CAN_GET_EXT_ID;
-
-    //deep copy data bytes
-    for( size_t i=0; i<frame.len; i++ ) {
-      frame.buf[i]=MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.EXT.data[i];
-    }
-
-    //send frame to input queue
-    xQueueSendToBackFromISR(RxQueue,&frame,0);
-  }
-
-  //Let the hardware know the frame has been read.
-  MODULE_CAN->CMR.B.RRB=1;
-}
-
-//*****************************************************************************
-void tNMEA2000_esp32::CAN_send_frame(tCANFrame &frame) {
-  CAN_FIR_t FIR;
-
-  FIR.U=0;
-  FIR.B.DLC=frame.len>8?8:frame.len;
-  FIR.B.FF=CAN_frame_ext;
-
-	//copy frame information record
-	MODULE_CAN->MBX_CTRL.FCTRL.FIR.U=FIR.U;
-
-  //Write message ID
-  _CAN_SET_EXT_ID(frame.id);
-
-  // Copy the frame data to the hardware
-  for ( size_t i=0; i<frame.len; i++) {
-    MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.EXT.data[i]=frame.buf[i];
-  }
-
-  // Transmit frame
-  MODULE_CAN->CMR.B.TR=1;
-}
-
-//*****************************************************************************
-void tNMEA2000_esp32::InterruptHandler() {
-	//Interrupt flag buffer
-	uint32_t interrupt;
-
-    // Read interrupt status and clear flags
-    interrupt = (MODULE_CAN->IR.U & 0xff);
-
-    // Handle TX complete interrupt
-    if ((interrupt & __CAN_IRQ_TX) != 0) {
-      tCANFrame frame;
-      if ( (xQueueReceiveFromISR(TxQueue,&frame,NULL)==pdTRUE) ) {
-        CAN_send_frame(frame);
-      }
-    }
-
-    // Handle RX frame available interrupt
-    if ((interrupt & __CAN_IRQ_RX) != 0) {
-    	CAN_read_frame();
-    }
-
-    // Handle error interrupts.
-    if ((interrupt & (__CAN_IRQ_ERR						//0x4
-                      | __CAN_IRQ_DATA_OVERRUN			//0x8
-                      | __CAN_IRQ_WAKEUP				//0x10
-                      | __CAN_IRQ_ERR_PASSIVE			//0x20
-                      | __CAN_IRQ_ARB_LOST				//0x40
-                      | __CAN_IRQ_BUS_ERR				//0x80
-        )) != 0) {
-    	/*handler*/
+    ESP_LOGI( LOG, "receive_task starting" );
+    twai_message_t message;
+    for ( ;; ) {
+        esp_err_t result = twai_receive( &message, pdMS_TO_TICKS( receive_timeout_secs * 1000 ));
+        if ( result == ESP_OK ) {
+            CAN_read_frame( &message );
+            continue;
+        }
+        if ( result == ESP_ERR_TIMEOUT ) {
+            ESP_LOGI( LOG, "nothing received in %d secs ", receive_timeout_secs );
+            // TODO maybe restart driver?
+            continue;
+        }
+        ESP_LOGW( LOG, "Unhandled result %04x %s from twai_receive",
+                  result,
+                  decodeEspResult( result ));
     }
 }
 
-//*****************************************************************************
-void ESP32Can1Interrupt(void *) {
-  pNMEA2000_esp32->InterruptHandler();
+const char *tNMEA2000_esp32::decodeEspResult( esp_err_t result ) {
+    switch ( result ) {
+        case ESP_ERR_INVALID_STATE:
+            return "ESP_ERR_INVALID_STATE";
+        default:
+            return "unknown";
+    }
+}
+
+void tNMEA2000_esp32::CAN_read_frame( void *frame ) {
+    twai_message_t *twai_message = (twai_message_t *) frame;
+    uint8_t len = twai_message->data_length_code;
+    if ( len > sizeof( tCANFrame::buf )) {
+        len = sizeof( tCANFrame::buf );
+    }
+    tCANFrame canFrame{
+            .id=twai_message->identifier,
+            .len = len
+    };
+    memcpy( canFrame.buf, twai_message->data, len );
+    // FromISR
+    xQueueSendToBack( RxQueue, &canFrame, 0 );
+}
+
+void tNMEA2000_esp32::alert_task( void *arg ) {
+    (void) arg;
+
+    ESP_LOGI( LOG, "alert_task starting" );
+    for ( ;; ) {
+        uint32_t alerts = 0;
+        esp_err_t result = twai_read_alerts( &alerts, portMAX_DELAY );
+        if ( result == ESP_ERR_TIMEOUT || alerts == 0 ) {
+            continue;
+        }
+//        ESP_LOGI( LOG, "alert got %08lx", alerts );
+        // TWAI_ALERT_TX_IDLE 0x00000001
+        // TWAI_ALERT_TX_SUCCESS 0x00000002
+        // TWAI_ALERT_RX_DATA 0x00000004
+        // TWAI_ALERT_ERR_ACTIVE 0x00000010
+        // TWAI_ALERT_BUS_ERROR 0x00000200
+        // twai_get_status_info(twai_status_info_t *status_info)
+//        if ( alerts & TWAI_ALERT_TX_IDLE ) {
+//            gpio_set_level( N2K_GPIO_NUM_STANDBY, 1 );
+//            ESP_LOGI( LOG, "transmit end" );
+//        }
+    }
+}
+
+extern void n2k_save_address( uint8_t address );
+
+static void address_changed_callback( TimerHandle_t timer ) {
+    (void) timer;
+    bool changed = instance->ReadResetAddressChanged();
+    if ( changed ) {
+        n2k_save_address( instance->GetN2kSource());
+    }
+}
+
+static void receive_task_main( void *arg ) {
+    instance->receive_task( arg );
+}
+
+static void alert_task_main( void *arg ) {
+    instance->alert_task( arg );
+}
+
+static void send_task_main( void *arg ) {
+    instance->send_task( arg );
+}
+
+void tNMEA2000_esp32::create_event_tasks() {
+    xTaskCreate( receive_task_main, "twai_rx", 3072, nullptr, 5, nullptr );
+    xTaskCreate( alert_task_main, "twai_idle", 2048, nullptr, 5, nullptr );
+    xTaskCreate( send_task_main, "twai_tx", 2048, nullptr, 5, nullptr );
+
+    TimerHandle_t timer = xTimerCreate(
+            "address_changed",
+            pdMS_TO_TICKS( 1 * 1000 ),
+            1,
+            nullptr,
+            address_changed_callback );
+    xTimerStart( timer, portMAX_DELAY );
 }
