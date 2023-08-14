@@ -33,7 +33,7 @@ void EspN2kStream::print( int value, int radix ) {
     } else if ( radix == 16) {
         printf("%02x", value);
     } else {
-        throw std::invalid_argument("unsupported radix ");
+//        throw std::invalid_argument("unsupported radix ");
     }
 }
 
