@@ -1,3 +1,4 @@
+//@formatter:off
 #ifndef NMEA2000_ESP32_H_
 #define NMEA2000_ESP32_H_
 
@@ -50,6 +51,9 @@ protected:
     bool CANOpen() override;
     bool CANSendFrame( unsigned long id, unsigned char len, const unsigned char *buf, bool wait_sent ) override;
     bool CANGetFrame( unsigned long &id, unsigned char &len, unsigned char *buf ) override;
+
+    bool isAbleToSendFrame() override;
+    bool isAbleToReceiveFrame() override;
 
     void InitCANFrameBuffers() override;
 public:
