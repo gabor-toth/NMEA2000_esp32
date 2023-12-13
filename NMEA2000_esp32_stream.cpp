@@ -1,7 +1,7 @@
+//@formatter:off
 #include "NMEA2000_esp32_stream.h"
-#include <cstdio>
-#include <iostream>
-#include <cstdarg>
+#include "stdio.h"
+#include "stdarg.h"
 
 const char* TAG = "n2k";
 
@@ -48,9 +48,9 @@ void EspN2kStream::println( const char *format, ... ) {
 }
 
 void EspN2kStream::println( int value ) {
-    std::cout << value << std::endl;
+    printf( "%d\n", value );
 }
 
 void EspN2kStream::println() {
-    std::cout << std::endl;
+    putchar( '\n' );
 }
