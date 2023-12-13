@@ -1,3 +1,4 @@
+//@formatter:off
 /*
 NMEA2000_esp32.cpp
 
@@ -59,6 +60,8 @@ tNMEA2000_esp32::tNMEA2000_esp32( gpio_num_t txPin, gpio_num_t rxPin, gpio_num_t
 void tNMEA2000_esp32::InitCANFrameBuffers() {
     if ( MaxCANReceiveFrames < 10 ) MaxCANReceiveFrames = 50; // ESP32 has plenty of RAM
     if ( MaxCANSendFrames < 10 ) MaxCANSendFrames = 40;
+    //CANGlobalBufSize = MaxCANSendFrames;
+    //MaxCANSendFrames = 0;
     uint16_t CANGlobalBufSize = MaxCANSendFrames - 4;
     MaxCANSendFrames = 4;  // we do not need much library internal buffer since driver has them.
     RxQueue = xQueueCreate( MaxCANReceiveFrames, sizeof( tCANFrame ));
@@ -296,4 +299,12 @@ void tNMEA2000_esp32::create_event_tasks() {
             nullptr,
             address_changed_callback );
     xTimerStart( timer, portMAX_DELAY );
+}
+
+bool tNMEA2000_esp32::isAbleToSendFrame() {
+    return uxQueueSpacesAvailable(TxQueue) > 0;
+}
+
+bool tNMEA2000_esp32::isAbleToReceiveFrame() {
+    return uxQueueMessagesWaiting( RxQueue ) > 0;
 }
