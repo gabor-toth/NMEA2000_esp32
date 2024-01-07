@@ -290,7 +290,7 @@ static void send_task_main( void *arg ) {
 void tNMEA2000_esp32::create_event_tasks() {
     xTaskCreate( receive_task_main, "twai_rx", 3072, nullptr, 5, nullptr );
     xTaskCreate( alert_task_main, "twai_idle", 2048, nullptr, 5, nullptr );
-    xTaskCreate( send_task_main, "twai_tx", 2048, nullptr, 5, nullptr );
+    xTaskCreate( send_task_main, "twai_tx", 3072, nullptr, 5, nullptr );
 
     TimerHandle_t timer = xTimerCreate(
             "address_changed",
