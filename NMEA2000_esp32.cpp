@@ -234,7 +234,8 @@ void tNMEA2000_esp32::CAN_read_frame( void *frame ) {
     }
     tCANFrame canFrame{
             .id=twai_message->identifier,
-            .len = len
+            .len = len,
+            .buf = {}
     };
     memcpy( canFrame.buf, twai_message->data, len );
     // FromISR
