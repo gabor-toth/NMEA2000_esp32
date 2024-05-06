@@ -85,13 +85,15 @@ bool tNMEA2000_esp32::CANOpen() {
 void tNMEA2000_esp32::CAN_init() {
     gpio_config_t io_conf = {};
 
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT_OD;
-    io_conf.pin_bit_mask = BIT( StandbyPin );
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config( &io_conf );
-    gpio_set_level( StandbyPin, 0 );
+    if ( StandbyPin != GPIO_NUM_NC ) {
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_OUTPUT_OD;
+        io_conf.pin_bit_mask = BIT( StandbyPin );
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        gpio_config( &io_conf );
+        gpio_set_level( StandbyPin, 0 );
+    }
 
     //Initialize configuration structures using macro initializers
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT( TxPin, RxPin, TWAI_MODE_NO_ACK );
