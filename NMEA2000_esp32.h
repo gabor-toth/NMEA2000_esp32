@@ -19,6 +19,8 @@
 #define ESP32_CAN_STANDBY_PIN GPIO_NUM_1
 #endif
 
+typedef void (*AddressChangedCallbackType)( uint8_t address );
+
 class tNMEA2000_esp32 : public tNMEA2000 {
 private:
     bool IsOpen;
@@ -38,6 +40,7 @@ protected:
     gpio_num_t StandbyPin;
     QueueHandle_t RxQueue;
     QueueHandle_t TxQueue;
+    AddressChangedCallbackType addressChangedCallback;
     static int receive_timeout_secs;
 
 protected:
@@ -56,6 +59,7 @@ protected:
     bool isAbleToReceiveFrame() override;
 
     void InitCANFrameBuffers() override;
+
 public:
     explicit tNMEA2000_esp32( gpio_num_t txPin = ESP32_CAN_TX_PIN,
                               gpio_num_t rxPin = ESP32_CAN_RX_PIN,
@@ -67,6 +71,10 @@ public:
     _Noreturn void send_task( void *arg );
 
     void CAN_send_frame( void *frame );
+
+    void setAddressChangedCallback(AddressChangedCallbackType callback);
+
+    void onAddressChanged();
 };
 
 #endif

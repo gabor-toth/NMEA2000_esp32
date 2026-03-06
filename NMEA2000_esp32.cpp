@@ -268,14 +268,9 @@ void tNMEA2000_esp32::alert_task( void *arg ) {
     }
 }
 
-extern void n2k_save_address( uint8_t address );
-
 static void address_changed_callback( TimerHandle_t timer ) {
     (void) timer;
-    bool changed = instance->ReadResetAddressChanged();
-    if ( changed ) {
-        n2k_save_address( instance->GetN2kSource());
-    }
+    instance->onAddressChanged();
 }
 
 static void receive_task_main( void *arg ) {
@@ -288,6 +283,10 @@ static void alert_task_main( void *arg ) {
 
 static void send_task_main( void *arg ) {
     instance->send_task( arg );
+}
+
+void tNMEA2000_esp32::setAddressChangedCallback(AddressChangedCallbackType callback) {
+    addressChangedCallback = callback;
 }
 
 void tNMEA2000_esp32::create_event_tasks() {
@@ -310,4 +309,11 @@ bool tNMEA2000_esp32::isAbleToSendFrame() {
 
 bool tNMEA2000_esp32::isAbleToReceiveFrame() {
     return uxQueueMessagesWaiting( RxQueue ) > 0;
+}
+
+void tNMEA2000_esp32::onAddressChanged() {
+    bool changed = instance->ReadResetAddressChanged();
+    if ( changed && addressChangedCallback != nullptr ) {
+        addressChangedCallback( instance->GetN2kSource());
+    }
 }
